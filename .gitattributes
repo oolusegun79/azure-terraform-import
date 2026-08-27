@@ -1,0 +1,15 @@
+# Normalise line endings so markdown and HCL stay consistent across
+# Windows, macOS and Linux clones.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF to run correctly.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files: never touch.
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary
+*.skill binary

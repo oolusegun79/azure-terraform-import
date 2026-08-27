@@ -1,0 +1,47 @@
+# Terraform working directories and providers
+**/.terraform/
+**/.terraform.lock.hcl
+
+# State: may contain secrets in plaintext. Never commit.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# Variable files: environment-specific and often hold credentials.
+# The committed template is terraform.tfvars.example.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Plan output: contains resolved variable values, including secrets.
+*.tfplan
+*.tfplan.*
+plan.out
+
+# CLI config that can hold credentials
+.terraformrc
+terraform.rc
+
+# Override files, which are intended for local-only use
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Discovery artefacts written by the skill: raw Azure metadata for a live
+# subscription (resource IDs, IPs, tags). Regenerated on every run.
+docs/exported-resources.json
+docs/EXPORTED-ARCHITECTURE.MD
+
+# Azure CLI output captured during discovery
+*.az.json
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.idea/
+.vscode/
