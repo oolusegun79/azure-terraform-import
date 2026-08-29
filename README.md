@@ -8,25 +8,27 @@ The skill lives at [`.claude/azure-terraform-import/SKILL.md`](.claude/azure-ter
 
 ## What it does
 
-You point it at something that already exists in Azure  a subscription, a resource group, or a handful of ARM resource IDs. It discovers what's there, works out how the pieces relate, picks the right AVM module for each resource type, writes the Terraform, derives the exact `import {}` addresses from the module source, and then keeps refining until `terraform plan` is clean.
+You point it at something that already exists in Azure: a subscription, a resource group, or a handful of ARM resource IDs. It discovers what's there, builds a dependency model, writes audit documentation, selects the right AVM module for each resource type, generates the Terraform, derives the exact `import {}` addresses from the downloaded module source, reconciles live property values against module defaults, and validates until `terraform plan` is clean.
 
-The goal is not "some Terraform that looks right." It is Terraform that **adopts** the existing resources without recreating them, and where `terraform plan` shows no destroys and no unwanted updates.
+The goal is not "some Terraform that looks right." It is Terraform that **adopts** the existing resources without recreating them, and where `terraform plan` shows no destroys and no unintended updates.
 
 ## When to use it
 
 - You inherited an environment built by hand in the portal and need it under version control
-- You want to codify a subscription or resource group as-is, without a rebuild
+- You want to codify a subscription, resource group, or set of resource IDs as-is, without a rebuild
 - You need to stop configuration drift on resources nobody has a source of truth for
-- A `terraform plan` after an import is showing unexpected `~ update` or `- destroy` lines
+- You are troubleshooting a Terraform import, or a plan that shows unexpected changes after one
+- You need dependencies mapped between discovered Azure resources
+- You need the appropriate AVM modules selected and implemented
 
 ## Prerequisites
 
 | Requirement | Why |
 |---|---|
 | Azure CLI, authenticated (`az login`) | All discovery runs through `az` |
-| Read access to the target scope | Discovery fails without RBAC on the subscription/RG |
+| Access to the target subscription or resource group | Discovery fails without the right RBAC |
 | Terraform CLI | `init` / `validate` / `plan`, and to download module source for address derivation |
-| Network access to Terraform Registry + the AVM index on GitHub | Module selection and README lookups |
+| Access to Terraform Registry and AVM resources | Module selection and README lookups |
 
 ## Inputs
 
@@ -34,21 +36,21 @@ At least **one** scope is required. Everything else is optional.
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `subscription-id` | No | Active CLI context | Subscription-scope discovery |
-| `resource-group-name` | No | None | Resource-group-scope discovery |
-| `resource-id` | No | None | One or more ARM resource IDs for targeted discovery |
+| `subscription-id` | No | Active CLI context | Discovery at the subscription scope, and setting the Azure CLI context |
+| `resource-group-name` | No | None | Discovery within the resource-group scope |
+| `resource-id` | No | None | One or more ARM resource IDs, for discovery at the specific-resource scope |
 
-ARM resource IDs are treated strictly as **cloud identifiers**, never as local file paths, they are only ever passed to `az ... --ids`.
+ARM resource IDs are treated strictly as **Azure identifiers**, never as local file paths; they are only ever passed to Azure CLI commands that support `--ids`.
 
 ---
 
 ## Step-by-step functionality
 
-### 1. Collect scope
+### 1. Define the discovery scope (required)
 
-The skill asks for exactly one scope and stops if none is given. Once a valid scope is present it stops asking follow-up questions, no re-prompting for a subscription when resource IDs were already supplied.
+The skill identifies exactly one scope before running anything, and requests it if none was supplied. Once a valid scope is present it stops asking; there is no re-prompting for a subscription when resource IDs were already given, and no follow-up questions the supplied scope already answers.
 
-### 2. Authenticate and set context
+### 2. Authenticate and set Azure context
 
 Runs only what the chosen scope needs:
 
@@ -58,118 +60,153 @@ az account set --subscription <subscription-id>
 az account show --query "{subscriptionId:id, name:name, tenantId:tenantId}" -o json
 ```
 
-For resource-group or specific-resource scope, `az account set` is skipped if the active context is already correct.
+For resource-group or specific-resource scope, `az account set` is optional when the active context is already correct, and `--ids` queries are preferred over subscription-wide discovery.
 
-### 3. Run discovery
+### 3. Discover existing resources
 
 ```bash
-az resource list --subscription <subscription-id> -o json        # subscription scope
-az resource list --resource-group <resource-group-name> -o json  # resource group scope
-az resource show --ids <resource-id> ... -o json                 # specific resources
+az resource list --subscription <subscription-id> -o json           # subscription scope
+az resource list --resource-group <resource-group-name> -o json     # resource group scope
+az resource show --ids <resource-id-1> <resource-id-2> ... -o json  # specific resources
 ```
 
-Output is the raw Azure metadata for each resource: `id`, `type`, `name`, `location`, `tags`, `properties`.
+Captures `id`, `type`, `name`, `location`, `tags` and `properties` for each resource. This discovery data becomes the source of truth for everything generated downstream.
 
-### 4. Resolve dependencies
+### 4. Analyze dependencies
 
-The discovery JSON is parsed to map parent-child relationships (NIC → Subnet → VNet), cross-resource references buried in `properties`, and the ordering Terraform will need.
+Before any Terraform is written, a dependency model is built from the discovered resources:
 
-**Two artefacts are written to `docs/` in the project root:**
+- Parent-child relationships (`NIC → Subnet → VNet`)
+- References between resources buried in `properties`
+- Required Terraform creation and import order
+- Shared infrastructure dependencies
 
-- `exported-resources.json`, every discovered resource with its metadata, dependencies and references
-- `EXPORTED-ARCHITECTURE.MD`, a human-readable architecture overview of what was found and how it hangs together
+The resulting graph is what makes imports and module composition reflect the deployed environment rather than a guess at it.
 
-This happens **before** any code generation, so the dependency graph is settled first.
+### 5. Generate discovery documentation
 
-### 5. Select AVM modules
+A `docs/` directory is created in the project root holding two artefacts:
 
-AVM modules are preferred over handwritten `azurerm_*` resources wherever one exists; any fallback to a native resource is documented as a gap.
+| Artefact | Contents |
+|---|---|
+| `docs/exported-resources.json` | Complete inventory of discovered resources, metadata, dependency mappings, cross-resource references |
+| `docs/exported-architecture.md` | Human-readable architecture summary: resource hierarchy, dependency overview, key components and design observations |
 
-Modules are found via the official AVM indexes (always latest, `main` branch):
+These serve as audit documentation in their own right, as well as the foundation for the generated Terraform.
 
-- [`TerraformResourceModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformResourceModules.csv)
-- [`TerraformPatternModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformPatternModules.csv)
-- [`TerraformUtilityModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformUtilityModules.csv)
+### 6. Select Azure Verified Modules
 
-Or by searching the Terraform Registry for `avm` + resource name and filtering by the **Partner** tag.
+> **Required:** use an AVM module wherever a suitable one exists. Native `azurerm_*` resources are only for cases where no AVM module is available, and the reason is documented.
 
-### 5a. Read the module README first, mandatory
+For each discovered resource: find the corresponding AVM module, select the latest compatible version, and record the source and version *before* generating code.
 
-Before a single line of HCL is written for a module, its README is fetched and read in full:
+**Module discovery sources**
+
+- **Terraform Registry**: search `avm <resource-name>`, filter by the **Partner** publisher tag (for example, `avm storage account`)
+- **Official AVM indexes** (authoritative, latest content on `main`):
+  - [`TerraformResourceModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformResourceModules.csv)
+  - [`TerraformPatternModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformPatternModules.csv)
+  - [`TerraformUtilityModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformUtilityModules.csv)
+- **Module documentation**: the Registry page (`https://registry.terraform.io/modules/Azure/<module>/azurerm/latest`) or the GitHub repository (`https://github.com/Azure/terraform-azurerm-avm-res-<service>-<resource>`), whose `README.md` is the primary implementation guidance
+
+### 6.1 Read the module README before writing code
+
+> **Mandatory:** never write AVM-based Terraform from memory, or from raw `azurerm` provider knowledge.
 
 ```text
 https://raw.githubusercontent.com/Azure/terraform-azurerm-avm-res-<service>-<resource>/refs/heads/main/README.md
 ```
 
-Three things are extracted **before** coding:
-
-1. **Required Inputs**, anything listed here (NICs, extensions, subnets, public IPs) is owned *inside* the module. Standalone sibling module blocks for those resources are wrong.
-2. **Optional Inputs**, the exact variable names and declared types. These frequently differ from the raw `azurerm` provider's argument names.
-3. **Usage examples**, which resource-group identifier the module wants (`parent_id` vs `resource_group_name`), and how child resources are expressed.
-
-Skipping this step is the single most common cause of broken AVM imports. The worked examples in the skill (VM module NIC ownership, TrustedLaunch booleans, `boot_diagnostics` as a `bool`, the AzAPI-backed VNet module's `parent_id`) are given as *patterns of mismatch to expect*, not as facts to apply blindly to every module.
-
-### 6. Generate Terraform
-
-#### 6a. Inspect module source before writing import blocks, mandatory
-
-After `terraform init` downloads the modules, the actual resource addresses are derived from the downloaded source. Import addresses are never written from memory.
+Or, once modules are downloaded:
 
 ```bash
-grep "^resource" .terraform/modules/<key>/main*.tf             # azurerm_* vs azapi_resource, and the label
-grep "^module"   .terraform/modules/<key>/main*.tf             # nested sub-modules -> extra path segments
-grep -n "count\|for_each" .terraform/modules/<key>/main*.tf    # [0] index vs string key
+cat .terraform/modules/<module_key>/README.md
 ```
 
-Which yields addresses of the shape:
+Three things are captured before any HCL is written:
 
-```text
-module.<root_key>.module.<child_key>["<map_key>"].<resource_type>.<label>[<index>]
-```
+| From | What to extract | Why it matters |
+|---|---|---|
+| **Required Inputs** | Which resources the module manages internally (NICs, VM extensions, public IPs, subnets) | Creating a separate module for a parent-owned resource is the classic AVM failure |
+| **Optional Inputs** | Variable names, supported types, accepted values, default behaviour | AVM variable names and structures frequently differ from the underlying provider's |
+| **Usage patterns** | Resource group identifiers (`parent_id` vs `resource_group_name`), nested resource definitions, map structures, provider conventions | Identifier style varies per module, including between AzAPI- and azurerm-backed ones |
 
-Reference patterns the skill carries as templates:
+The rules that follow: determine ownership from Required Inputs, determine accepted parameters from Optional Inputs and `variables.tf`, follow the README examples for identifier formats, and never infer arguments from native `azurerm_*` resources.
 
-| Resource | Import `to` address pattern |
-|---|---|
-| AzAPI-backed VNet | `module.<vnet_key>.azapi_resource.vnet` |
-| Subnet (nested, count-based) | `module.<vnet_key>.module.subnet["<name>"].azapi_resource.subnet[0]` |
-| Linux VM (count-based) | `module.<vm_key>.azurerm_linux_virtual_machine.this[0]` |
-| VM NIC | `module.<vm_key>.azurerm_network_interface.virtualmachine_network_interfaces["<nic_key>"]` |
-| VM extension (default `deploy_sequence=5`) | `module.<vm_key>.module.extension["<name>"].azurerm_virtual_machine_extension.this` |
-| NSG-NIC association | `module.<vm_key>.azurerm_network_interface_security_group_association.this["<nic>-<nsg>"]` |
+### 7. Generate Terraform configuration
 
-#### 6b. Files produced
+Generated from the selected modules and the dependency model:
 
 | File | Contents |
 |---|---|
-| `providers.tf` | `azurerm` provider + version constraints |
+| `providers.tf` | Provider configuration and version constraints |
 | `main.tf` | AVM module blocks with explicit dependencies |
 | `variables.tf` | Environment-specific values |
 | `outputs.tf` | Key IDs and endpoints |
 | `terraform.tfvars.example` | Placeholder values |
 
-Module versions are pinned explicitly.
+Module versions are always pinned to a fixed version, never floated.
 
-#### 6c. Diff live properties against module defaults, mandatory
+### 7.1 Inspect module source before writing import blocks
 
-Every non-zero property of each live resource is compared against the default declared in the AVM module's `variables.tf`. Anything that differs is set explicitly in the config, this is where silent drift comes from.
+> **Mandatory:** never construct import addresses from memory.
 
-Common offenders:
-
-- **Timeouts**, Public IP `idle_timeout_in_minutes` defaults to `4`, live deployments often run `30`
-- **Network policy flags**, subnet `private_endpoint_network_policies` defaults to `Enabled`, existing subnets are often `Disabled`
-- **SKU and allocation**, Public IP `sku`, `allocation_method`
-- **Availability zones**, VM and Public IP zones
-- **Redundancy/replication** on storage and database resources
-
-Full properties are pulled with targeted `az ... show` calls, because `az resource list` omits nested and computed properties:
+After `terraform init` downloads the modules, the real addresses are derived from the downloaded source:
 
 ```bash
-az network public-ip show --ids <id> --query "{idleTimeout:idleTimeoutInMinutes, sku:sku.name, zones:zones}" -o json
-az network vnet subnet show --ids <id> --query "{privateEndpointPolicies:privateEndpointNetworkPolicies, delegation:delegations}" -o json
+grep "^resource" .terraform/modules/<module_key>/main*.tf            # provider type (azurerm vs azapi), labels
+grep "^module"   .terraform/modules/<module_key>/main*.tf            # nested modules, so the full path
+grep -n "count\|for_each" .terraform/modules/<module_key>/main*.tf   # [0] index vs string key
 ```
 
-### 7. Validate
+Resources reached through a child module need the complete nested path:
+
+```text
+module.<root_module>.module.<child_module>["<key>"].<resource_type>.<label>[<index>]
+```
+
+`count`-based resources require a numeric index such as `[0]`; `for_each`-based resources require string keys.
+
+Example patterns, to be verified against the downloaded source every time:
+
+| Resource type | Example import address |
+|---|---|
+| Virtual Network | `module.<vnet>.azapi_resource.vnet` |
+| Subnet | `module.<vnet>.module.subnet["<name>"].azapi_resource.subnet[0]` |
+| Linux VM | `module.<vm>.azurerm_linux_virtual_machine.this[0]` |
+| VM NIC | `module.<vm>.azurerm_network_interface.virtualmachine_network_interfaces["<nic>"]` |
+| VM Extension | `module.<vm>.module.extension["<extension>"].azurerm_virtual_machine_extension.this` |
+
+### 7.2 Reconcile live configuration with module defaults
+
+> **Mandatory:** imported infrastructure should not drift because a module default differs from the live Azure setting.
+
+For each discovered resource: retrieve the detailed live properties, compare them against the AVM defaults in `variables.tf`, and explicitly configure anything that differs.
+
+Common sources of drift:
+
+- Timeouts and idle settings
+- Network policy configuration
+- SKU and allocation settings
+- Availability zones
+- Storage redundancy and replication settings
+- Database configuration options
+
+Properties are pulled with targeted `az ... show` calls, because `az resource list` may omit nested or computed values:
+
+```bash
+az network public-ip show \
+  --ids <resource_id> \
+  --query "{idleTimeout:idleTimeoutInMinutes,sku:sku.name,zones:zones}" \
+  -o json
+
+az network vnet subnet show \
+  --ids <resource_id> \
+  --query "{privateEndpointPolicies:privateEndpointNetworkPolicies,delegations:delegations}" \
+  -o json
+```
+
+### 8. Validate the generated Terraform
 
 ```bash
 terraform init
@@ -178,7 +215,9 @@ terraform validate
 terraform plan
 ```
 
-**Definition of done:** the plan shows **0 destroys and 0 unwanted changes**. Telemetry `+ create` resources are acceptable; any `~ update` or `- destroy` against real infrastructure must be resolved before the import is called complete.
+**Success criteria:** no syntax errors, validation completes, dependencies resolve, and the plan accurately reflects the discovered environment.
+
+**Definition of done:** the plan shows **0 destroys** and **0 unintended updates**. Telemetry resources created by the modules are acceptable when expected.
 
 ---
 
@@ -186,40 +225,42 @@ terraform plan
 
 Every run reports:
 
-1. Scope used (subscription, resource group, or resource IDs)
-2. Discovery files created
-3. Resource types detected
-4. AVM modules selected, with versions
-5. Terraform files generated or updated
+1. Discovery scope used
+2. Documentation and discovery files created
+3. Resource types identified
+4. Selected AVM modules and versions
+5. Terraform files generated or modified
 6. Validation command results
-7. Open gaps requiring your input
+7. Outstanding gaps or required user input
 
-## Guardrails
+## Agent rules
 
-These are the rules the skill holds itself to, and the reasoning behind each:
+The constraints the skill holds itself to, and the reasoning behind each:
 
 - **No scope, no start.** Discovery against the wrong subscription is worse than no discovery.
-- **README before HCL.** Required Inputs decide child-resource ownership; guessing produces "provider configuration not present" errors and duplicated resources.
-- **Never assume NICs, extensions or public IPs are standalone.** For any AVM module, treat child resources as parent-owned until the README says otherwise.
-- **Never write import addresses from memory.** Provider label, sub-module nesting and `count` vs `for_each` all vary per module and per version.
-- **ARM IDs are not file paths.** They belong in `az --ids`, never in `cat`, `ls` or a glob.
-- **Don't re-prompt for known scope.** Ask again only when a concrete command fails for want of context.
-- **AVM first, fallbacks justified.** Each handwritten `azurerm_*` resource is documented as a gap.
+- **Dependency analysis before code generation.** Import order and module composition both depend on it.
+- **AVM first, exceptions justified.** Every non-AVM implementation is explicitly documented.
+- **README before HCL.** Required Inputs decide child-resource ownership; guessing produces duplicated resources and provider errors.
+- **Ownership from documentation, not assumption.** Whether a NIC, extension or public IP is standalone is a per-module fact.
+- **Inspect module source before import blocks.** Provider type, nesting and `count` vs `for_each` all vary by module and version.
+- **ARM IDs are Azure identifiers, never file paths.** They belong in `az --ids`, never in `cat`, `ls` or a glob.
+- **No unnecessary scope prompts.** Ask again only when a command genuinely fails for want of context.
+- **Not complete until the plan is clean.** No unintended changes, or it isn't done.
 
 ## Troubleshooting
 
-| Problem | Likely cause | Action |
+| Issue | Likely cause | Recommended action |
 |---|---|---|
-| `az` fails with authorization errors | Wrong tenant/subscription, or missing RBAC | Re-run `az login`, verify context, confirm permissions |
-| Discovery output is empty | Wrong scope, or nothing in scope | Re-check the scope input and re-run |
-| No AVM module for a resource type | Not yet covered by AVM | Use the native `azurerm_*` resource and document the gap |
-| `terraform validate` fails | Missing variables or unresolved dependencies | Add the variables and explicit dependencies, re-validate |
-| Unknown argument / variable not found | AVM variable name differs from the `azurerm` argument | Check the module README and `variables.tf` |
-| Import fails, resource not found at address | Wrong provider label, missing sub-module path, or missing `[0]` | `grep "^resource"` and `grep "^module"` the downloaded module source |
-| Plan shows unexpected `~ update` on an imported resource | Live value differs from the module default | Fetch the live property with `az ... show`, set it explicitly |
-| "Provider configuration not present" on a child resource | Child declared standalone though the parent module owns it | Check Required Inputs, remove the sibling module, model it inline |
-| Nested child import "resource not found" | Missing intermediate module path, wrong map key, or missing index | Rebuild the full nested address from the module source |
-| Agent reads an ARM ID as a file path, or loops on scope questions | ID not routed to `--ids`; provided scope not trusted | ARM IDs go to `az --ids` only; stop re-prompting once one scope is valid |
+| Azure CLI authorization errors | Incorrect tenant, subscription, or RBAC permissions | Re-authenticate and verify access |
+| Discovery returns no resources | Incorrect scope | Validate the subscription, resource group, or resource IDs |
+| No AVM module available | Module does not exist yet | Use `azurerm_*` and document the exception |
+| `terraform validate` fails | Missing variables or dependencies | Add the required inputs and dependency references |
+| Unknown module argument | AVM variable differs from the provider argument | Check the README and `variables.tf` |
+| Import address not found | Incorrect provider type, label, nesting, or index | Inspect the downloaded module source |
+| Unexpected updates in plan | Live values differ from module defaults | Explicitly set the live values in configuration |
+| Child-resource ownership issues | Resource is managed by a parent module | Model it through the parent module's inputs |
+| Nested import failures | Missing module path, map key, or index | Build the complete address from module source |
+| ARM IDs treated as file paths | Incorrect handling of resource identifiers | Use Azure CLI `--ids` arguments only |
 
 ## References
 
