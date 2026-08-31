@@ -493,7 +493,7 @@ so the `.tf` files sit alongside `docs/`, with no wrapper directory.
 > **This layout holds exactly one Terraform root module, so it holds exactly one Azure scope.** The
 > scope slug survives only in `docs/<scope-slug>/` and in the backend state key, which is what keeps
 > the artifacts traceable. If a second scope is ever imported into the same repository, it has
-> nowhere to go without a restructure — raise that with the user before generating a second
+> nowhere to go without a restructure. Raise that with the user before generating a second
 > configuration rather than merging two scopes into one root module and one state file.
 
 If the project already has an established layout for infrastructure code, follow that instead, and
@@ -506,9 +506,9 @@ Create, in the project root:
 - `main.tf`
 - `variables.tf`
 - `outputs.tf`
-- `imports.tf` — the import blocks from step 7.1
+- `imports.tf`: the import blocks from step 7.1
 - `terraform.tfvars.example`
-- `.gitignore` — ignore `.terraform/`, `*.tfstate*`, and `terraform.tfvars`; commit `.terraform.lock.hcl`
+- `.gitignore`: ignore `.terraform/`, `*.tfstate*`, and `terraform.tfvars`; commit `.terraform.lock.hcl`
 
 #### Derive Provider Version Constraints
 

@@ -8,9 +8,7 @@ The skill lives at [`.claude/skills/azure-terraform-import/SKILL.md`](.claude/sk
 
 ## What it does
 
-You point it at something that already exists in Azure: a subscription, a resource group, or a handful of ARM resource IDs. It discovers what's there, builds a dependency model, writes audit documentation, selects the right AVM module for each resource type, generates the Terraform, derives the exact `import {}` addresses from the downloaded module source, reconciles live property values against module defaults, and validates until `terraform plan` is clean.
-
-The goal is not "some Terraform that looks right." It is Terraform that **adopts** the existing resources without recreating them, and where `terraform plan` shows no destroys and no unintended updates.
+You point it at something that already exists in Azure: a subscription, a resource group, or a handful of ARM resource IDs. It discovers what's there (including the child objects and extension resources that `az resource list` never returns), builds a dependency model, writes audit documentation, selects the right AVM module for each resource type, generates the Terraform, derives the exact `import {}` addresses from the downloaded module source, reconciles live values against module defaults, and does not stop at a clean plan: it applies, then proves the second plan is empty.
 
 It runs in one of two modes, decided before anything is generated:
 
@@ -37,7 +35,7 @@ It runs in one of two modes, decided before anything is generated:
 |---|---|
 | Azure CLI, authenticated (`az login`) | All discovery runs through `az` |
 | Access to the target subscription or resource group | Discovery fails without the right RBAC |
-| Terraform CLI | `init` / `validate` / `plan`, and to download module source for address derivation |
+| Terraform CLI | `init` / `validate` / `plan` / `apply`, and to download module source for address derivation |
 | Access to Terraform Registry and AVM resources | Module selection and README lookups |
 
 ## Inputs
@@ -59,13 +57,17 @@ ARM resource IDs are treated strictly as **Azure identifiers**, never as local f
 
 ## Step-by-step functionality
 
-### 1. Define the discovery scope (required)
+### 1. Establish the objective, then the scope
 
-The skill identifies exactly one scope before running anything, and requests it if none was supplied. Once a valid scope is present it stops asking; there is no re-prompting for a subscription when resource IDs were already given, and no follow-up questions the supplied scope already answers.
+Two questions, in this order.
+
+**Import or redeployment?** They share everything up to step 6 and invert each other after it, so the wrong assumption is expensive to unwind. "Clone PROD to TEST", "copy this environment" and "stand this up in another subscription" are redeployment however they are worded, and users routinely call them imports. Ambiguity gets a question, not a guess.
+
+**Which scope?** One of subscription, resource group, or resource IDs. Once a valid scope is present the skill stops asking; there is no re-prompting for a subscription when resource IDs were already given.
+
+A `<scope-slug>` is then derived from the scope (resource group name, hyphenated subscription name, or resource name) and used to name `docs/<scope-slug>/` and the backend state key, so every artefact is traceable to the Azure scope it came from. Generic names like `docs/terraform` are explicitly rejected, since they collide the moment a second scope enters the repository.
 
 ### 2. Authenticate and set Azure context
-
-Runs only what the chosen scope needs:
 
 ```bash
 az login
@@ -83,156 +85,141 @@ az resource list --resource-group <resource-group-name> -o json     # resource g
 az resource show --ids <resource-id-1> <resource-id-2> ... -o json  # specific resources
 ```
 
-Captures `id`, `type`, `name`, `location`, `tags` and `properties` for each resource. This discovery data becomes the source of truth for everything generated downstream.
+Captures `id`, `type`, `name`, `location`, `tags` and `properties`. This becomes the source of truth for everything downstream. But it is only the top layer, which is why the next two steps exist.
+
+### 3.1 Enumerate child objects explicitly
+
+> `az resource list` returns only top-level ARM resources. Container services hold child objects it never lists, and those objects are usually the substance of the environment.
+
+Every container resource has its collections queried directly: Data Factory pipelines, datasets, linked services, integration runtimes and triggers; Synapse pools and firewall rules; storage containers, shares, queues and tables; Key Vault keys, secrets and certificates. Where no first-party CLI command exists, `az rest` against the ARM API rather than skipping the check.
+
+**Counters lie.** A Data Factory reports `factoryStatistics.totalResourceCount = 0` while holding published pipelines. Any aggregate is unverified until the collection endpoints confirm it.
+
+Child objects also carry cross-resource references that never appear in the parent's ARM properties, such as a linked service pointing at a storage account, and those feed the dependency analysis.
+
+### 3.2 Enumerate extension resources (AVM interfaces)
+
+Separate from child objects: the cross-cutting resources attached to anything. Missing them produces an import that looks complete and is not.
+
+| Extension resource | Discover with | AVM module input |
+|---|---|---|
+| Role assignments | `az role assignment list --scope "<resource id>"` | `role_assignments` |
+| Diagnostic settings | `az monitor diagnostic-settings list --resource "<resource id>"` | `diagnostic_settings` |
+| Management locks | `az lock list --resource-group <rg>` | `lock` |
+| Private endpoints | `az network private-endpoint list -g <rg>` | `private_endpoints` |
+
+Two failure modes silently report "nothing found", and both have produced falsely clean results:
+
+- **Query per resource, not per resource group.** `az role assignment list --resource-group <rg>` does not return assignments scoped to resources inside that group. The group reports `0` while its storage account carries two.
+- **Guard ARM IDs on Git Bash / MSYS.** Without `MSYS_NO_PATHCONV=1`, the shell rewrites `/subscriptions/...` into `C:/Program Files/Git/subscriptions/...` and the call fails.
+
+Errors are never suppressed on these calls. An empty collection and a broken command must not look the same.
 
 ### 4. Analyze dependencies
 
-Before any Terraform is written, a dependency model is built from the discovered resources:
-
-- Parent-child relationships (`NIC → Subnet → VNet`)
-- References between resources buried in `properties`
-- Required Terraform creation and import order
-- Shared infrastructure dependencies
-
-The resulting graph is what makes imports and module composition reflect the deployed environment rather than a guess at it.
+A dependency model is built before any Terraform is written: parent-child relationships (`NIC → Subnet → VNet`), references buried in `properties`, the required creation and import order, and shared infrastructure. This is what makes module composition reflect the deployed environment rather than a guess at it.
 
 ### 5. Generate discovery documentation
 
-A `docs/` directory is created in the project root holding two artefacts:
+Written to `docs/<scope-slug>/`:
 
 | Artefact | Contents |
 |---|---|
-| `docs/exported-resources.json` | Complete inventory of discovered resources, metadata, dependency mappings, cross-resource references |
-| `docs/exported-architecture.md` | Human-readable architecture summary: resource hierarchy, dependency overview, key components and design observations |
+| `exported-resources.json` | Complete inventory: resources, metadata, dependency mappings, cross-resource references |
+| `exported-architecture.md` | Human-readable architecture summary, hierarchy, dependency overview, design observations |
 
-These serve as audit documentation in their own right, as well as the foundation for the generated Terraform.
+These are the audit record, and they remain useful long after the import. For a redeployment they are the specification of the source.
 
 ### 6. Select Azure Verified Modules
 
-> **Required:** use an AVM module wherever a suitable one exists. Native `azurerm_*` resources are only for cases where no AVM module is available, and the reason is documented.
+> **Required:** use an AVM module wherever a suitable one exists. Native `azurerm_*` resources only where none is available, with the reason documented.
 
-For each discovered resource: find the corresponding AVM module, select the latest compatible version, and record the source and version *before* generating code.
-
-**Module discovery sources**
-
-- **Terraform Registry**: search `avm <resource-name>`, filter by the **Partner** publisher tag (for example, `avm storage account`)
-- **Official AVM indexes** (authoritative, latest content on `main`):
-  - [`TerraformResourceModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformResourceModules.csv)
-  - [`TerraformPatternModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformPatternModules.csv)
-  - [`TerraformUtilityModules.csv`](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformUtilityModules.csv)
-- **Module documentation**: the Registry page (`https://registry.terraform.io/modules/Azure/<module>/azurerm/latest`) or the GitHub repository (`https://github.com/Azure/terraform-azurerm-avm-res-<service>-<resource>`), whose `README.md` is the primary implementation guidance
+Found via the Terraform Registry (search `avm <resource>`, filter by the **Partner** tag) or the official AVM indexes for [resource](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformResourceModules.csv), [pattern](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformPatternModules.csv) and [utility](https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/refs/heads/main/docs/static/module-indexes/TerraformUtilityModules.csv) modules. Source and version are recorded before any code is generated.
 
 ### 6.1 Read the module README before writing code
 
 > **Mandatory:** never write AVM-based Terraform from memory, or from raw `azurerm` provider knowledge.
 
-```text
-https://raw.githubusercontent.com/Azure/terraform-azurerm-avm-res-<service>-<resource>/refs/heads/main/README.md
-```
-
-Or, once modules are downloaded:
-
-```bash
-cat .terraform/modules/<module_key>/README.md
-```
-
-Three things are captured before any HCL is written:
-
 | From | What to extract | Why it matters |
 |---|---|---|
-| **Required Inputs** | Which resources the module manages internally (NICs, VM extensions, public IPs, subnets) | Creating a separate module for a parent-owned resource is the classic AVM failure |
-| **Optional Inputs** | Variable names, supported types, accepted values, default behaviour | AVM variable names and structures frequently differ from the underlying provider's |
-| **Usage patterns** | Resource group identifiers (`parent_id` vs `resource_group_name`), nested resource definitions, map structures, provider conventions | Identifier style varies per module, including between AzAPI- and azurerm-backed ones |
-
-The rules that follow: determine ownership from Required Inputs, determine accepted parameters from Optional Inputs and `variables.tf`, follow the README examples for identifier formats, and never infer arguments from native `azurerm_*` resources.
+| **Required Inputs** | Which resources the module manages internally (NICs, extensions, public IPs, subnets) | Creating a separate module for a parent-owned resource is the classic AVM failure |
+| **Optional Inputs** | Variable names, types, accepted values, defaults | AVM names and structures frequently differ from the underlying provider's |
+| **Usage patterns** | `parent_id` vs `resource_group_name`, nested definitions, map structures | Identifier style varies per module, including between AzAPI- and azurerm-backed ones |
 
 ### 7. Generate Terraform configuration
 
-Generated from the selected modules and the dependency model:
+The repository is itself the Terraform root module, so `.tf` files sit in the project root alongside `docs/`, with no wrapper directory:
 
-| File | Contents |
-|---|---|
-| `providers.tf` | Provider configuration and version constraints |
-| `main.tf` | AVM module blocks with explicit dependencies |
-| `variables.tf` | Environment-specific values |
-| `outputs.tf` | Key IDs and endpoints |
-| `terraform.tfvars.example` | Placeholder values |
+```text
+<project-root>/
+├── docs/<scope-slug>/{exported-resources.json, exported-architecture.md}
+├── providers.tf, main.tf, variables.tf, outputs.tf
+├── imports.tf
+├── terraform.tfvars.example
+└── .gitignore
+```
 
-Module versions are always pinned to a fixed version, never floated.
+> One root module holds one Azure scope. A second scope has nowhere to go without a restructure, which is raised with the user rather than merging two scopes into one state file.
+
+**State is decided before the first apply, not after.** Local state is rarely acceptable for an import: it is the only record of the work, it is gitignored and backed up by nothing, two concurrent runs diverge with no locking, and it holds in plaintext every secret that had to be supplied because Azure would not return it. An `azurerm` backend on versioned blob storage gives both locking and point-in-time recovery.
+
+**AVM telemetry defaults to on.** It adds the `modtm` provider as a real dependency, and contributes a `random_uuid` plus a `modtm_telemetry` resource *per module and submodule*, so the count scales with module nesting. Five modules can easily mean twenty additions in the plan. Usually set `enable_telemetry = false` for an import, where a readable diff is the whole point. Either way, the count is predicted before the plan, never explained after it.
+
+Module versions are always pinned.
 
 ### 7.1 Inspect module source before writing import blocks
 
 > **Mandatory:** never construct import addresses from memory.
 
-After `terraform init` downloads the modules, the real addresses are derived from the downloaded source:
+After `terraform init`, the real addresses come from the downloaded source:
 
 ```bash
-grep "^resource" .terraform/modules/<module_key>/main*.tf            # provider type (azurerm vs azapi), labels
-grep "^module"   .terraform/modules/<module_key>/main*.tf            # nested modules, so the full path
+grep "^resource" .terraform/modules/<module_key>/main*.tf            # azurerm vs azapi, labels
+grep "^module"   .terraform/modules/<module_key>/main*.tf            # nested modules, full path
 grep -n "count\|for_each" .terraform/modules/<module_key>/main*.tf   # [0] index vs string key
 ```
-
-Resources reached through a child module need the complete nested path:
 
 ```text
 module.<root_module>.module.<child_module>["<key>"].<resource_type>.<label>[<index>]
 ```
 
-`count`-based resources require a numeric index such as `[0]`; `for_each`-based resources require string keys.
-
-Example patterns, to be verified against the downloaded source every time:
-
-| Resource type | Example import address |
-|---|---|
-| Virtual Network | `module.<vnet>.azapi_resource.vnet` |
-| Subnet | `module.<vnet>.module.subnet["<name>"].azapi_resource.subnet[0]` |
-| Linux VM | `module.<vm>.azurerm_linux_virtual_machine.this[0]` |
-| VM NIC | `module.<vm>.azurerm_network_interface.virtualmachine_network_interfaces["<nic>"]` |
-| VM Extension | `module.<vm>.module.extension["<extension>"].azurerm_virtual_machine_extension.this` |
+`azapi_update_resource` is the exception: it models a PATCH rather than owning a resource, cannot be imported at all, and is documented as a known non-importable item instead.
 
 ### 7.2 Reconcile live configuration with module defaults
 
-> **Mandatory:** imported infrastructure should not drift because a module default differs from the live Azure setting.
+Live properties are retrieved per resource, compared against the AVM defaults in `variables.tf`, and anything that differs is set explicitly. Targeted `az ... show` calls, because `az resource list` omits nested and computed properties.
 
-For each discovered resource: retrieve the detailed live properties, compare them against the AVM defaults in `variables.tf`, and explicitly configure anything that differs.
+**One input can silently override another.** AVM modules often expose a coarse input and finer ones, resolved with `coalesce`, where the coarse input wins whenever it is non-null and its default is frequently not null. In `avm-res-storage-storageaccount` 0.9.0, `sku_name = coalesce(var.account_sku_name, "${var.account_tier}_${var.account_replication_type}")` with `account_sku_name` defaulting to `"Standard_ZRS"` makes `account_replication_type = "LRS"` inert. Grep how a module consumes an input before setting it.
 
-Common sources of drift:
+### 7.3 Reconcile attributes that do not survive import
 
-- Timeouts and idle settings
-- Network policy configuration
-- SKU and allocation settings
-- Availability zones
-- Storage redundancy and replication settings
-- Database configuration options
+7.2 handles values that differ from a default. This handles values **absent from state after import**, which is the more dangerous failure: anything the provider's Read does not return lands as `null`, so configuring the correct value reads as a change, and on a ForceNew attribute as a destroy and recreate.
 
-Properties are pulled with targeted `az ... show` calls, because `az resource list` may omit nested or computed values:
+The decision rule: if the attribute is ForceNew, **match the null**, always. Otherwise choose deliberately between matching the null (clean plan, configuration does not record the value) and asserting it (complete configuration, one in-place write), and say which.
 
-```bash
-az network public-ip show \
-  --ids <resource_id> \
-  --query "{idleTimeout:idleTimeoutInMinutes,sku:sku.name,zones:zones}" \
-  -o json
-
-az network vnet subnet show \
-  --ids <resource_id> \
-  --query "{privateEndpointPolicies:privateEndpointNetworkPolicies,delegations:delegations}" \
-  -o json
-```
+`null` also does not reach through `optional()`: Terraform substitutes the default whenever an optional object attribute is null, so passing `null` sends the default. Where that default would change live infrastructure, use a different input or drop to `azapi_resource`.
 
 ### 8. Validate the generated Terraform
 
 ```bash
-terraform init
-terraform fmt -recursive
-terraform validate
-terraform plan
+terraform init && terraform fmt -recursive && terraform validate
+terraform plan -out=plan.bin && terraform show -json plan.bin > plan.json
 ```
 
-**Success criteria:** no syntax errors, validation completes, dependencies resolve, and the plan accurately reflects the discovered environment.
+**Verify the plan mechanically, not by eye.** A five-resource plan runs to hundreds of lines, and a `sku` block just outside the scrollback that was actually read is enough to miss a real change. Assert property by property against `docs/<scope-slug>/`, exit non-zero on any difference, and ignore only what is legitimately environment-specific (names, principal IDs, Azure-generated resource group names). "No functional changes" is reported from a check that counted what it compared, never from a visual scan.
 
-**Definition of done:** the plan shows **0 destroys** and **0 unintended updates**. Telemetry resources created by the modules are acceptable when expected.
+Success is **0 destroys and 0 unintended updates**, with every addition attributable to predicted telemetry or a stated exception. A clean plan means ready to apply. It does not mean done.
 
----
+### 9. Complete the import
+
+> **Mandatory:** an import is not complete at `plan`. Until `apply` runs there is no state file, and the configuration manages nothing.
+
+1. **Apply**, never with `-lock=false`. Import errors surface here rather than at plan: a resource that no longer exists, an ID whose casing does not match, an address resolving to nothing.
+2. **Prove idempotency.** The real test is the *second* plan. A plan clean before apply and dirty after is a failed import, not a finished one.
+3. **Remove the import blocks.** One-shot migration aids; delete `imports.tf` and confirm the plan is still empty. The discovery documentation stays.
+4. **Report**, including the applied resource count and the empty post-apply plan.
+
+`apply` is never run without the user's explicit agreement. It writes state and can mutate live infrastructure through any in-place update in the plan.
 
 ---
 
@@ -265,32 +252,39 @@ The trap worth knowing: step 7.2 tells the agent to pin every live value that di
 default, which is right for an import and wrong for a clone. Both 7.2 and 7.3 carry redeployment
 caveats for that reason, and step 1 forks before either is reached.
 
+---
 
 ## What you get back
 
-Every run reports:
-
-1. Discovery scope used
-2. Documentation and discovery files created
+1. Discovery scope used, and the `<scope-slug>` derived from it
+2. Documentation and discovery files created, with their paths
 3. Resource types identified
 4. Selected AVM modules and versions
 5. Terraform files generated or modified
-6. Validation command results
-7. Outstanding gaps or required user input
+6. Validation results, including the post-apply plan when step 9 has run
+7. Attributes that could not be discovered, and the consequence of supplying the wrong value
+8. Resources deliberately excluded, and why
+9. Outstanding gaps or required user input
+
+A redeployment also reports source and target scopes separately, the naming convention and every name that had to change, the state key or workspace the target uses, the R7 diff, and what the user must still supply or restore.
 
 ## Agent rules
 
 The constraints the skill holds itself to, and the reasoning behind each:
 
-- **No scope, no start.** Discovery against the wrong subscription is worse than no discovery.
-- **Dependency analysis before code generation.** Import order and module composition both depend on it.
-- **AVM first, exceptions justified.** Every non-AVM implementation is explicitly documented.
-- **README before HCL.** Required Inputs decide child-resource ownership; guessing produces duplicated resources and provider errors.
-- **Ownership from documentation, not assumption.** Whether a NIC, extension or public IP is standalone is a per-module fact.
-- **Inspect module source before import blocks.** Provider type, nesting and `count` vs `for_each` all vary by module and version.
-- **ARM IDs are Azure identifiers, never file paths.** They belong in `az --ids`, never in `cat`, `ls` or a glob.
-- **No unnecessary scope prompts.** Ask again only when a command genuinely fails for want of context.
-- **Not complete until the plan is clean.** No unintended changes, or it isn't done.
+- **No scope, no start**, and no generated code before import versus redeployment is settled. The two invert nearly every identifier decision.
+- **One root module, one scope.** A second scope in the same repository is a restructure to raise, not a merge to perform.
+- **Enumerate child collections and extension resources explicitly.** Never conclude a resource is empty from a summary counter or its absence in `az resource list`.
+- **Never suppress errors on discovery commands.** An empty collection and a failed call must not look the same.
+- **AVM first, exceptions justified**, and child-resource ownership read from module documentation rather than assumed.
+- **Never write import addresses from memory.** Provider type, nesting and `count` vs `for_each` vary by module and version.
+- **Check how a module consumes an input before setting it.** An input guarded by `coalesce` behind a non-null default does nothing.
+- **Check ForceNew before configuring a value that imported as null.** Asserting one destroys live infrastructure to change nothing.
+- **Never invent an undiscoverable value.** Expose it as a sensitive variable and say what supplying the wrong one will do.
+- **Decide the backend before the first apply**, and never apply with `-lock=false`.
+- **Verify plans mechanically**, against the discovery artefacts, never by reading a diff.
+- **Not complete until the post-apply plan is empty.** A clean pre-apply plan is not a completed import.
+- **Never let a redeployment touch the source's state, workspace, or provider context**, and never carry its globally-unique names, principal IDs or private DNS links into a target.
 
 ## Troubleshooting
 
@@ -298,14 +292,16 @@ The constraints the skill holds itself to, and the reasoning behind each:
 |---|---|---|
 | Azure CLI authorization errors | Incorrect tenant, subscription, or RBAC permissions | Re-authenticate and verify access |
 | Discovery returns no resources | Incorrect scope | Validate the subscription, resource group, or resource IDs |
+| Role assignments report zero | Queried per resource group instead of per resource | Iterate every resource ID with `--scope` |
+| ARM ID becomes a `C:/Program Files/Git/...` path | Git Bash path conversion | `export MSYS_NO_PATHCONV=1` before the `az` call |
 | No AVM module available | Module does not exist yet | Use `azurerm_*` and document the exception |
-| `terraform validate` fails | Missing variables or dependencies | Add the required inputs and dependency references |
 | Unknown module argument | AVM variable differs from the provider argument | Check the README and `variables.tf` |
+| Input set but has no effect | Outranked by a coarser input inside a `coalesce` | Grep the module for how the variable is consumed |
 | Import address not found | Incorrect provider type, label, nesting, or index | Inspect the downloaded module source |
-| Unexpected updates in plan | Live values differ from module defaults | Explicitly set the live values in configuration |
-| Child-resource ownership issues | Resource is managed by a parent module | Model it through the parent module's inputs |
-| Nested import failures | Missing module path, map key, or index | Build the complete address from module source |
-| ARM IDs treated as file paths | Incorrect handling of resource identifiers | Use Azure CLI `--ids` arguments only |
+| `Resource Import Not Implemented` | The target is an `azapi_update_resource` | Document it as a known non-importable addition |
+| Unexpected updates in plan | Live values differ from module defaults | Explicitly set the live values |
+| Plan clean before apply, dirty after | Drift hidden behind an import or addition | The post-apply plan is the real test |
+| Unexplained additions in the plan | AVM telemetry, one pair per module and submodule | Predict the count, or set `enable_telemetry = false` |
 
 ## References
 
