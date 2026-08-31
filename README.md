@@ -2,7 +2,7 @@
 
 A Claude Code skill that reverse-engineers **live Azure infrastructure into maintainable Terraform**, built on Azure CLI discovery and [Azure Verified Modules (AVM)](https://github.com/Azure/Azure-Verified-Modules).
 
-The skill lives at [`.claude/azure-terraform-import/SKILL.md`](.claude/azure-terraform-import/SKILL.md) and is invoked as `azure-terraform-import`.
+The skill lives at [`.claude/skills/azure-terraform-import/SKILL.md`](.claude/skills/azure-terraform-import/SKILL.md) and is invoked as `azure-terraform-import`.
 
 ---
 
@@ -12,6 +12,15 @@ You point it at something that already exists in Azure: a subscription, a resour
 
 The goal is not "some Terraform that looks right." It is Terraform that **adopts** the existing resources without recreating them, and where `terraform plan` shows no destroys and no unintended updates.
 
+It runs in one of two modes, decided before anything is generated:
+
+| Mode | Goal | Success |
+|---|---|---|
+| **Import** | Adopt resources that already exist | `apply`, then an empty plan |
+| **Redeployment** | Stand the same environment up somewhere else, for example clone PROD to TEST | A plan that creates the environment, verified against the source |
+
+> **It copies infrastructure shape, not data.** The ARM control plane is reproduced: resources, their configuration, and the relationships between them. Blob contents, database rows, VM disk contents and Key Vault secret values are not. Worth saying out loud, because "clone PROD" is usually heard as including the data.
+
 ## When to use it
 
 - You inherited an environment built by hand in the portal and need it under version control
@@ -20,6 +29,7 @@ The goal is not "some Terraform that looks right." It is Terraform that **adopts
 - You are troubleshooting a Terraform import, or a plan that shows unexpected changes after one
 - You need dependencies mapped between discovered Azure resources
 - You need the appropriate AVM modules selected and implemented
+- You want to clone an environment: PROD into TEST, the same platform in a second subscription or tenant, or a rebuild after a teardown
 
 ## Prerequisites
 
@@ -39,6 +49,9 @@ At least **one** scope is required. Everything else is optional.
 | `subscription-id` | No | Active CLI context | Discovery at the subscription scope, and setting the Azure CLI context |
 | `resource-group-name` | No | None | Discovery within the resource-group scope |
 | `resource-id` | No | None | One or more ARM resource IDs, for discovery at the specific-resource scope |
+| `target-subscription-id` | No | None | **Redeployment only.** The subscription the environment is redeployed into, never the discovery source |
+| `target-resource-group-name` | No | None | **Redeployment only.** The resource group the redeployment creates or deploys into |
+| `environment-name` | No | None | **Redeployment only.** Short token for the target environment (`test`, `uat`, `dr`), driving the naming convention |
 
 ARM resource IDs are treated strictly as **Azure identifiers**, never as local file paths; they are only ever passed to Azure CLI commands that support `--ids`.
 
@@ -220,6 +233,38 @@ terraform plan
 **Definition of done:** the plan shows **0 destroys** and **0 unintended updates**. Telemetry resources created by the modules are acceptable when expected.
 
 ---
+
+---
+
+## Redeployment: cloning an environment
+
+Steps 1 to 6 are identical for a clone. The discovery artefacts are the specification of the source.
+Everything after step 6 inverts, because the two jobs are opposites:
+
+| | Import | Redeployment |
+|---|---|---|
+| Target | Resources that exist | A scope that does not exist yet |
+| Identifiers | Pin exactly | Parameterise every one; pinning source identifiers is a defect |
+| Identities | The captured principal GUIDs | Module outputs, since a new environment mints new identities |
+| `imports.tf` | The deliverable | Meaningless, delete it |
+| Success | `apply`, then an empty plan | A plan that creates the environment, verified against the source |
+
+The redeployment steps replace 7.1 to 9:
+
+| Step | What it covers |
+|---|---|
+| **R1. Set the target context** | Confirm the target subscription and tenant explicitly rather than inheriting the CLI context still pointed at the source. Aliased providers where both appear in one configuration, separate tfvars where they do not. |
+| **R2. Parameterise names** | Storage accounts, Key Vaults, ACR, App Service, SQL, Cosmos, public DNS labels are globally unique, so reusing a source name fails the apply. One convention driven from `environment-name`, plus the soft-delete and name-length traps. |
+| **R3. Give the target its own state** | A separate backend key or workspace. Writing into the source's state means the next plan proposes destroying the source. |
+| **R4. Reconcile the network** | Address space reuse versus peering, repointing peerings, binding private endpoints to the target's private DNS zones, and rules that name source addresses. |
+| **R5. Decide sizing deliberately** | A faithful clone reproduces the source's SKUs, zone redundancy and bill. Agree per resource class what the target should be, and check the target region offers it. |
+| **R6. State what does not come across** | Data, secret and certificate values, principal IDs and the access that trusts them, and every write-only value. Delivered as a list of what the user must still do. |
+| **R7. Verify the clone against the source** | Re-run discovery against the target and diff it against the source, ignoring what is legitimately environment-specific. Each remaining difference is either an intended R5 decision or a gap. |
+
+The trap worth knowing: step 7.2 tells the agent to pin every live value that differs from a module
+default, which is right for an import and wrong for a clone. Both 7.2 and 7.3 carry redeployment
+caveats for that reason, and step 1 forks before either is reached.
+
 
 ## What you get back
 
