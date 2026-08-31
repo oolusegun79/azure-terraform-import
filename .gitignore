@@ -32,6 +32,8 @@ override.tf.json
 
 # Discovery artefacts written by the skill: raw Azure metadata for a live
 # subscription (resource IDs, IPs, tags). Regenerated on every run.
+docs/*/exported-resources.json
+docs/*/exported-architecture.md
 docs/exported-resources.json
 docs/exported-architecture.md
 docs/EXPORTED-ARCHITECTURE.MD

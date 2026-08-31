@@ -1,11 +1,33 @@
 ---
 name: azure-terraform-import
-description: 'Use this to reverse-engineer existing Azure environments into Terraform using Azure CLI discovery and Azure Verified Modules (AVM). It is the preferred approach for importing subscriptions, resource groups, or specific ARM resource IDs; generating Terraform for portal-built environments; creating import blocks; selecting the correct AVM module and version; mapping dependencies; and resolving unexpected plan changes after imports. Apply it even when users describe the problem indirectly, such as “we have no Terraform for this subscription,” “the portal is our source of truth,” “how do we stop drift,” or “can you codify what’s already deployed?” In these cases, the underlying need is an AVM-based import. Use it equally when the goal is to REDEPLOY a captured environment rather than import it - "recreate PROD in TEST", "stand this up in another subscription", "we need the same platform on a second machine", or a rebuild after a teardown - because the discovery half is identical and the skill covers how the two diverge. For existing Azure resources, prefer this approach over manually writing azurerm_* resources.'
+description: 'Use this to reverse-engineer existing Azure environments into Terraform using Azure CLI discovery and Azure Verified Modules (AVM). It is the preferred approach for importing subscriptions, resource groups, or specific ARM resource IDs; generating Terraform for portal-built environments; creating import blocks; selecting the correct AVM module and version; mapping dependencies; and resolving unexpected plan changes after imports. Apply it even when users describe the problem indirectly, such as “we have no Terraform for this subscription,” “the portal is our source of truth,” “how do we stop drift,” or “can you codify what’s already deployed?” In these cases, the underlying need is an AVM-based import. The configuration it produces is always rebuildable: delete the resource group and `terraform apply` recreates everything, and pointing it at another scope is a change of variables, not a different workflow. So use it just as readily for "recreate PROD in TEST", "stand this up in another subscription", "we need the same platform on a second machine", or a rebuild after a teardown. For existing Azure resources, prefer this approach over manually writing azurerm_* resources.'
 ---
 
 # Azure Terraform Import
 
 Convert existing Azure infrastructure into maintainable Terraform code using Azure resource discovery and Azure Verified Modules (AVM).
+
+## The Contract
+
+**The deliverable is a configuration that can rebuild the environment from nothing.** Delete the
+resource group, run `terraform apply`, and everything comes back.
+
+Import blocks are a means, not the goal. They let Terraform adopt what is already live so the first
+apply does not duplicate it, and they are deleted once state exists. What survives is a configuration
+that does not depend on any resource it did not create.
+
+Every rule below serves that contract. Three consequences are easy to get wrong, and each has its
+own section:
+
+- **The scope owns itself.** The resource group is a resource the configuration creates, never one it
+  reads. See step 3 and the rebuildability rules in step 7.
+- **Nothing in scope is read with a data source.** A data source is a dependency on something the
+  configuration cannot create.
+- **Every value needed to create a resource lives in the configuration or in `terraform.tfvars`.** A
+  value that only exists in Azure is a hole in the rebuild.
+
+> Test it the way it will be used: delete the resource group, run `terraform apply`, and confirm the
+> environment returns. That is step 10, and it is not optional.
 
 > **This skill copies infrastructure shape, not data.** It captures and reproduces the ARM control
 > plane: resources, their configuration, and the relationships between them. It does not copy blob
@@ -20,8 +42,9 @@ Use this skill when the user asks to:
 - Import existing Azure resources into Terraform
 - Prefer AVM modules over handwritten `azurerm_*` resources for existing infrastructure
 - Recreate infrastructure from a subscription, resource group, or set of resource IDs
-- Redeploy a captured environment into a new scope: clone PROD to TEST, stand the same platform up
-  in a second subscription or tenant, or rebuild after a teardown
+- Produce Terraform that can rebuild an environment from nothing after a teardown
+- Stand a captured environment up in another scope: clone PROD to TEST, or the same platform in a
+  second subscription or tenant
 - Troubleshoot Terraform imports, drift, or unexpected plan changes
 - Map dependencies between discovered Azure resources
 - Select and implement the appropriate AVM modules
@@ -42,40 +65,23 @@ At least one of `subscription-id`, `resource-group-name`, or `resource-id` is re
 | `subscription-id` | No | Active CLI context | Azure subscription used to discover resources at the subscription scope and set the Azure CLI context. |
 | `resource-group-name` | No | None | Azure resource group used to discover resources within the resource-group scope. |
 | `resource-id` | No | None | One or more Azure ARM resource IDs used to discover resources at the specific-resource scope. |
-| `target-subscription-id` | No | None | **Redeployment only.** The subscription the environment is redeployed *into*. Never the discovery source. |
-| `target-resource-group-name` | No | None | **Redeployment only.** The resource group the redeployment creates or deploys into. |
-| `environment-name` | No | None | **Redeployment only.** Short token distinguishing the target environment (`test`, `uat`, `dr`). Drives the naming strategy in step R2. |
+| `target-subscription-id` | No | None | **Second copy only.** The subscription to stand a copy up in while the original still exists. Never the discovery source. |
+| `target-resource-group-name` | No | None | **Second copy only.** The resource group the copy deploys into. |
+| `environment-name` | No | None | **Second copy only.** Short token distinguishing the copy (`test`, `uat`, `dr`). Drives the naming strategy in step R2. |
 
-The last three apply only to redeployment. A redeployment needs a source scope **and** a target;
-supplying only one is the most common setup error, and the one that puts target resources into the
-source subscription.
+The last three are needed only to stand a **second** copy up alongside an original that still exists.
+A rebuild in place needs none of them: the names are free once the resource group is gone, so
+`terraform apply` returns the environment as it was. When a copy is wanted, it needs a source scope
+**and** a target; supplying only one is the error that puts the copy into the source subscription.
 
 
 ## Workflow
 
 ### 1. Define the Discovery Scope (Required)
 
-#### Establish the Objective First
-
-Before scope, establish which of two jobs this is. They share everything up to step 6 and invert
-each other after it, so the wrong assumption is expensive to unwind:
-
-- **Import.** The resources exist and should be adopted into Terraform as they are.
-- **Redeployment.** The resources exist somewhere and the user wants them stood up *somewhere else*:
-  PROD into TEST, a second subscription, another tenant, or a rebuild after a teardown.
-
-"Clone PROD to TEST", "copy this environment", "stand this up in another subscription" and "we need
-the same setup on a second machine" are all redeployment, however they are worded, and users
-routinely call them imports.
-
-For a redeployment, run steps 1 to 6 unchanged, then follow the **redeployment track** below instead
-of steps 7.1 to 9. Do not generate `imports.tf`, and read the redeployment caveats in 7.2 and 7.3
-before pinning any live value.
-
-When it is genuinely ambiguous, ask. One question costs less than a configuration that pins a source
-environment's identifiers into a target.
-
-#### Select the Scope
+Do not ask whether the user wants an exact copy, a TEST variant, or a rebuild. The answer is always
+the same configuration: one that recreates the environment as discovered, and can be pointed at
+another scope by changing variables. Build that, every time.
 
 Before running any discovery commands, identify one of the following scopes:
 
@@ -166,6 +172,28 @@ Capture all relevant resource information, including:
 - properties
 
 This discovery data becomes the source of truth for Terraform generation.
+
+#### Capture the Scope Container Itself
+
+> **`az resource list` does not return the resource group.** It lists what is *inside* the group. A
+> configuration built only from that list has no resource group in it, so it can only reference one
+> that already exists. Delete the group and `terraform plan` fails with
+> `Resource Group ... was not found` before it creates anything. This is the single most common way a
+> generated configuration turns out not to be rebuildable.
+
+Capture the container as a resource in its own right:
+
+```bash
+az group show --name <resource-group-name>   --query "{name:name, location:location, tags:tags, managedBy:managedBy}" -o json
+```
+
+For subscription scope, do this for every resource group the discovery touched. Record each one in
+the discovery artifacts alongside the resources it holds, and model it in step 7 with
+`avm-res-resources-resourcegroup` (or `azurerm_resource_group`) so the configuration creates it.
+
+The same applies to anything else the resources sit inside and the configuration should own: a
+Log Analytics workspace that diagnostic settings point at, a shared VNet, a Key Vault holding
+referenced secrets. If it is in scope, it is created, not read.
 
 #### 3.1 Enumerate Child Objects Explicitly
 
@@ -510,6 +538,52 @@ Create, in the project root:
 - `terraform.tfvars.example`
 - `.gitignore`: ignore `.terraform/`, `*.tfstate*`, and `terraform.tfvars`; commit `.terraform.lock.hcl`
 
+#### Rebuildability Rules
+
+> **Mandatory:** These are what make the difference between a configuration that describes the
+> environment and one that can recreate it. Check every one before generating.
+
+**1. The resource group is a managed resource.** Generate it from the `az group show` output in step
+3. Every other module takes its name or ID from that module's output, never from a hardcoded string
+and never from a data source.
+
+**2. No data source for anything in scope.** `data "azurerm_resource_group"`, `data
+"azurerm_key_vault"`, `data "azurerm_log_analytics_workspace"` and friends are each a dependency on
+something the configuration cannot create. Reference the module output instead. Data sources are
+legitimate only for things genuinely outside the scope and genuinely pre-existing, such as a hub VNet
+owned by another team; list every one in the report as an external prerequisite.
+
+**3. Defer data sources that AVM modules read internally.** Some modules read their parent with
+`data "azurerm_resource_group"` inside the module. Terraform resolves a data source at plan time
+whenever its configuration is fully known, so the read happens *before* the resource group is
+created and the plan fails. Break that by making the dependency explicit:
+
+```hcl
+module "storage" {
+  source     = "Azure/avm-res-storage-storageaccount/azurerm"
+  version    = "<pinned>"
+  parent_id  = module.rg.resource_id
+  depends_on = [module.rg]   # defers every data source inside the module to apply
+}
+```
+
+`depends_on` at module level is the only thing that defers a module's internal data sources. A
+resource-level reference does not.
+
+**4. Every create-time value is in the configuration.** Anything Azure will not return on import
+(passwords, keys, connection strings) is still required to *create* the resource. Declare it as a
+variable, mark it sensitive, and put a placeholder in `terraform.tfvars.example`. A configuration
+that imports cleanly but cannot create is a failed deliverable, not a trade-off.
+
+**5. `imports.tf` never gates a plan.** Import blocks resolve at plan time and fail if their target
+does not exist, which is exactly the state after a teardown. They belong in their own file, they are
+deleted once state exists (step 9), and a rebuild plan runs without them.
+
+**6. Names are variables, not literals.** Drive resource names from a variable with the discovered
+value as its default. Rebuilding in place then needs no edit, and standing a copy up elsewhere needs
+only a different `terraform.tfvars`. This is what removes the need to ask whether the user wants a
+duplicate or a separate environment: the same configuration does both.
+
 #### Derive Provider Version Constraints
 
 Module versions are not enough - `required_providers` must satisfy every module at once. Read the
@@ -801,11 +875,16 @@ For every attribute that imports as null:
 
 1. **Is it ForceNew?** Check the provider schema. If yes, **match the null** - always. Asserting a
    value on a ForceNew attribute destroys and recreates live infrastructure to change nothing.
-2. **Otherwise, choose deliberately and say which:**
-   - *Match the null* for a clean plan, accepting that the configuration does not record the value and
-     a rebuild from it would be incomplete.
-   - *Assert the value* for a complete, rebuildable configuration, accepting one in-place write. Only
-     where re-asserting is semantically a no-op against what is already live.
+2. **Otherwise, assert the value.** The contract is a configuration that can rebuild the
+   environment, and a value the configuration does not record is a value the rebuild cannot supply.
+   Accept the one in-place write, where re-asserting is semantically a no-op against what is already
+   live.
+
+   *Match the null* only when asserting would change live infrastructure. That buys a clean plan at
+   the cost of a hole in the rebuild, so record it as a **rebuild gap** in the report, naming the
+   resource, the attribute, and what will be missing or wrong after a `terraform apply` into an empty
+   scope. A gap that is written down is a decision; one that is not is a defect waiting to surface at
+   the worst moment.
 3. **If the value cannot be discovered at all**, expose it as a required variable, mark it
    `sensitive`, document that it cannot be read back, and state the consequence of supplying the wrong
    one. Never invent a plausible-looking value: a guessed password or connection string is applied as
@@ -939,25 +1018,69 @@ line is theirs. Present the plan, state what it will change, and ask.
 
 ---
 
-## Redeployment Track: Standing the Environment Up Elsewhere
+### 10. Prove the Configuration Can Rebuild
 
-Users often describe this task as an import when what they actually want is to stand the same
-environment up somewhere else - a second subscription, a TEST alongside PROD, a rebuild after a
-teardown. Confirm which it is before generating anything, because the two invert each other:
+> **Mandatory:** An empty plan proves the configuration matches what is live. It proves nothing about
+> whether the configuration could create it. Those are different claims, and only the second one is
+> the contract.
 
-| | Import | Redeployment |
+Everything up to step 9 was verified against resources that already existed. The rebuild path has
+never run. Prove it before reporting the work complete.
+
+**1. Plan against an empty scope.** Point the configuration at a scope that does not exist, with
+`imports.tf` deleted and a state file that is empty:
+
+```bash
+terraform plan -state=/dev/null -var-file=rebuild-check.tfvars
+```
+
+Every resource must appear as `+ create`, and the plan must complete without error. What you are
+looking for is not the diff but the failures:
+
+- `Resource Group ... was not found`, or any other *not found*, means something is being read rather
+  than created. Find the data source and remove it, or add the module-level `depends_on` from step 7.
+- A missing required variable means a create-time value is not in the configuration. Add it.
+- A resource that does not appear at all was never modelled. Go back to steps 3.1 and 3.2.
+
+**2. Rebuild for real, at least once.** A plan catches missing references; only an apply catches
+values that are wrong rather than absent. Into a throwaway resource group, ideally in a separate
+subscription:
+
+```bash
+terraform apply -var-file=rebuild-check.tfvars   # then destroy it
+```
+
+This is the step that would have caught a deleted resource group before the user found it. If the
+user declines the cost or the time, say plainly that rebuildability is untested rather than letting
+the report imply otherwise.
+
+**3. Report the rebuild gaps.** Every attribute recorded as a gap in 7.3, every external prerequisite
+left as a data source, and every value the user must supply in `terraform.tfvars` for a rebuild to
+work. This list is part of the deliverable, not a footnote.
+
+---
+
+## Standing the Environment Up Alongside the Original
+
+A configuration that satisfies the contract already rebuilds its own scope: delete the resource
+group, `terraform apply`, and it returns under the same names, because those names are free again.
+Nothing extra is needed for that case, and nothing needs asking.
+
+One case does need more: standing a **second** copy up while the first still exists, such as a TEST
+alongside a live PROD. The configuration does not change, but some values in `terraform.tfvars` must,
+because two environments cannot share them. Work through R1 to R7 when, and only when, the original
+is still standing.
+
+| | Rebuild in place | Second copy alongside |
 |---|---|---|
-| Target | Resources that exist | A scope that does not exist yet |
-| Identifiers | Pin exactly - names, principal IDs, managed resource group names, ARM ID casing | Parameterise every one; pinning a source environment's identifiers is a defect |
-| Identities | The captured principal GUIDs | Module outputs - a new environment mints new identities |
-| `imports.tf` | The deliverable | Meaningless; delete it |
-| Success | `apply` then an empty plan | A plan that creates the environment, verified against the discovery artifacts |
+| Names | Unchanged; the originals are free | Must change wherever the namespace is global |
+| State | The same backend key | Its own key or workspace |
+| Identities | New principal IDs, so role assignments rebuild from module outputs | Same |
+| Network | Unchanged | New address space if it peers to the same hub |
+| Verification | Step 10 | Step 10, then R7 against the original |
 
-Discovery (steps 1-5) is identical and is worth doing either way, and AVM module selection (step 6)
-is unchanged. The artifacts are the specification. What changes is everything after step 6: steps 7.1
-to 9 are replaced by the R steps below.
-
-Three things break when a pinned import is redeployed unchanged:
+Three things break when a configuration that pinned discovered values is applied alongside the
+original:
 
 - **Principal IDs.** Role assignments bind to the source environment's managed identities, which do
   not exist in the target. Take them from module outputs instead.
@@ -1058,10 +1181,14 @@ Network configuration is the part of a clone most likely to apply cleanly and st
 
 ### R5. Decide Sizing Deliberately
 
-A faithful clone reproduces the source's SKUs, capacity, zone redundancy and bill. That is rarely
-what a TEST environment is for. Agree per resource class whether the target matches the source or is
-deliberately reduced, and record the decision in `terraform.tfvars.example` so the difference is
-visible rather than accidental.
+Reproduce the source faithfully by default, including SKUs, capacity and zone redundancy. Do not ask
+whether the user wants something smaller: the configuration is generated once and sizing is a
+variable, so a cheaper TEST is a different `terraform.tfvars`, not a different generation run.
+
+What that requires is that sizing *is* a variable. Expose SKU, capacity, replication and zone inputs
+rather than hardcoding the discovered values into module blocks, with the discovered value as the
+default. Mention in the report that a faithful copy carries the source's cost, and that these are the
+inputs to change.
 
 Check the target region offers what the source uses. SKU availability, zone counts and some service
 features are regional; a configuration valid in one region can be unbuildable in another.
@@ -1120,7 +1247,9 @@ This diff is what proves the clone. Without it, the claim that TEST matches PROD
 | A plan that worked earlier now fails with no config change | Live infrastructure changed underneath, not Terraform | Check `az monitor activity-log list --offset <n>h` for deletes and their caller before re-deriving anything |
 | An input that names a property has no effect | Another module input outranks it via `coalesce`, and its default is not null | Read how the module consumes the variable - step 7.2 |
 | `Cycle: module.a ... module.b` | Two AVM modules each need an output of the other, typically a resource ID one way and a principal ID back | Move the role assignment out to the root module as a native `azurerm_role_assignment`; the cycle is between modules, not resources |
-| `Resource Group ... was not found` during PLAN, before anything is created | A module reads its parent with `data "azurerm_resource_group"`, and the config is fully known so Terraform resolves it at plan time | Add module-level `depends_on` on the resource group module, which defers every data source in that module to apply |
+| `Resource Group ... was not found` during PLAN, before anything is created | Either the resource group is not in the configuration at all (`az resource list` never returned it), or a module reads it with `data "azurerm_resource_group"`, which Terraform resolves at plan time because the config is fully known | Model the group as a managed resource from `az group show` (step 3), reference it by module output, and add module-level `depends_on` so any data source inside a module defers to apply - step 7 rebuildability rules |
+| Plan fails after the resource group was deleted | `imports.tf` is still present, and import blocks resolve at plan time against resources that no longer exist | Delete `imports.tf`; it is a one-shot adoption aid, not part of the configuration - step 9 |
+| Rebuild apply fails on a missing required variable | A create-time value was never captured because import did not need it | Every value needed to *create* must be a variable with a placeholder in `terraform.tfvars.example` - step 7.3 |
 | A second configuration is discovered for resources already under management | The backend was checked for existence but not for contents | List the state blobs before generating - step 7 |
 
 ---
@@ -1138,6 +1267,9 @@ When presenting results, include:
 7. Attributes that could not be discovered, and the consequence of supplying the wrong value
 8. Resources deliberately excluded, and why
 9. Outstanding gaps or required user input
+10. The rebuild check from step 10: whether a plan against an empty scope succeeded, whether an
+    actual rebuild apply was run, and every rebuild gap, external prerequisite and variable the user
+    must supply for `terraform apply` to recreate the environment
 
 For a redeployment, also include:
 
@@ -1185,8 +1317,16 @@ For a redeployment, also include:
   changes. A clean pre-apply plan is not a completed import.
 - List the contents of the state backend before generating Terraform, not just its existence. If a
   state file already manages the scope, stop and raise it.
-- Establish whether the user wants an import or a redeployment into a new environment before
-  generating code. The two invert nearly every identifier decision.
+- Deliver a configuration that can rebuild the environment from nothing. Never ask whether the user
+  wants a duplicate, a TEST variant, or a rebuild; the answer is one configuration that does all
+  three through its variables.
+- Model the resource group, and every other in-scope container, as a resource the configuration
+  creates. `az resource list` does not return it, so capture it with `az group show`.
+- Never use a data source for anything in scope. Where an AVM module reads its parent internally, add
+  module-level `depends_on` so the read defers to apply. Report every remaining data source as an
+  external prerequisite.
+- Prove the rebuild before reporting completion: plan against an empty scope with `imports.tf`
+  removed, and say plainly when an actual rebuild apply was not run.
 - Never let a redeployment write to the source environment's state file, workspace, or provider
   context. Confirm the target subscription explicitly rather than inheriting the CLI context used
   for discovery.
