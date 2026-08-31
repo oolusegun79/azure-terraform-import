@@ -153,6 +153,12 @@ Found via the Terraform Registry (search `avm <resource>`, filter by the **Partn
 | **Optional Inputs** | Variable names, types, accepted values, defaults | AVM names and structures frequently differ from the underlying provider's |
 | **Usage patterns** | `parent_id` vs `resource_group_name`, nested definitions, map structures | Identifier style varies per module, including between AzAPI- and azurerm-backed ones |
 
+**Standard AVM interfaces.** Modules implement a common set of cross-cutting inputs, and these are how the extension resources found in step 3.2 are expressed: `role_assignments`, `diagnostic_settings`, `private_endpoints`, `lock`, `managed_identities`, `customer_managed_key`, plus `tags` and `enable_telemetry`.
+
+> Model extension resources through these inputs, **never as standalone `azurerm_*` resources**. The module owns the object, so a parallel native resource declaring the same assignment or setting will fight it, and the two overwrite each other on alternate applies.
+
+Coverage is not uniform across modules, so each interface is confirmed in the module's own `variables.tf` rather than assumed. The skill carries an observed coverage matrix across five modules for exactly this reason.
+
 ### 7. Generate Terraform configuration
 
 The repository is itself the Terraform root module, so `.tf` files sit in the project root alongside `docs/`, with no wrapper directory:
@@ -167,6 +173,10 @@ The repository is itself the Terraform root module, so `.tf` files sit in the pr
 ```
 
 > One root module holds one Azure scope. A second scope has nowhere to go without a restructure, which is raised with the user rather than merging two scopes into one state file.
+
+**Check whether the scope is already managed, before generating anything.** A backend existing is not the same as a backend being empty: the objects inside it get listed. Finding a state file that already manages the scope changes the task into reconciling with that configuration rather than writing a second one, because two root modules managing one set of resources will fight, and neither owner is correct. If the owning configuration cannot be found on disk, that is said plainly rather than assumed absent; it may live on another machine or in CI.
+
+**Provider constraints are derived, not guessed.** Module versions alone are not enough, since `required_providers` must satisfy every module at once. The **Requirements** section of each module README is read and the constraints intersected: four modules declaring `>= 4.81, < 5.2`, `>= 4.12, < 5.0`, `>= 4.28, < 5.0` and `>= 3.0, < 5.0` intersect to `>= 4.81, < 5.0`. Same for `azapi`, `random`, `time` and `modtm`. The intersection is recorded as a comment, and `.terraform.lock.hcl` is committed.
 
 **Rebuildability rules.** These are what separate a configuration that describes the environment from one that can recreate it:
 
